@@ -1,0 +1,1 @@
+python transfer_maniskill2lerobot.py --dataset_file /data/vla_dataset/mshab_data/data/scene_datasets/replica_cad_dataset/rearrange-dataset/set_table/pick/013_apple.h5 > log.log 2>&1
