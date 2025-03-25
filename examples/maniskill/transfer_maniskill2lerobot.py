@@ -12,7 +12,7 @@ Date:   2025/03/21
 
 """
 import os
-os.environ["LEROBOT_HOME"] = "/data/vla_dataset/mani_lerobot"
+os.environ["LEROBOT_HOME"] = "/data/vla_dataset/mani_lerobot2"
 import shutil
 import h5py
 import numpy as np
@@ -85,7 +85,12 @@ def main(dataset_file: str, *, push_to_hub: bool = False, load_count: int = -1):
                 "dtype": "float32",
                 "shape": (12,),  # 根据实际情况调整状态向量的维度
                 "names": ["state_v"],
-            }
+            },
+            # "prompt":{
+            #     "dtype": "string",
+            #     "shape": (),
+            #     "names": ["prompt"],
+            # }
         },
         image_writer_threads=10,
         image_writer_processes=5,
@@ -180,7 +185,8 @@ def main(dataset_file: str, *, push_to_hub: bool = False, load_count: int = -1):
                 "wrist_image": tmp_wrist_image,
                 "state": tmp_state,
                 "actions": tmp_action,
-                "state_v": tmp_state_v
+                "state_v": tmp_state_v,
+                # "prompt": task_desc,
             })
 
         dataset.save_episode(task=task_desc)

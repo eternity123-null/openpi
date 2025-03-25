@@ -10,9 +10,9 @@ from openpi.models import model as _model
 def make_libero_example() -> dict:
     """Creates a random input example for the Libero policy."""
     return {
-        "observation/state": np.random.rand(8),
-        "observation/image": np.random.randint(256, size=(224, 224, 3), dtype=np.uint8),
-        "observation/wrist_image": np.random.randint(256, size=(224, 224, 3), dtype=np.uint8),
+        "observation/state": np.random.rand(13),
+        "observation/image": np.random.randint(256, size=(128, 128, 3), dtype=np.uint8),
+        "observation/wrist_image": np.random.randint(256, size=(128, 128, 3), dtype=np.uint8),
         "prompt": "do something",
     }
 
@@ -27,7 +27,7 @@ def _parse_image(image) -> np.ndarray:
 
 
 @dataclasses.dataclass(frozen=True)
-class LiberoInputs(transforms.DataTransformFn):
+class ManiskillInputs(transforms.DataTransformFn):
     """
     This class is used to convert inputs to the model to the expected format. It is used for both training and inference.
 
@@ -52,7 +52,7 @@ class LiberoInputs(transforms.DataTransformFn):
         # since the pi0-FAST action_dim = 7, which is < state_dim = 8, so pad is skipped.
         # Keep this for your own dataset, but if your dataset stores the proprioceptive input
         # in a different key than "observation/state", you should change it below.
-        state = transforms.pad_to_dim(data["observation/state"], self.action_dim)
+        state = transforms.pad_to_dim(data["state"], self.action_dim)
 
         # Possibly need to parse images to uint8 (H,W,C) since LeRobot automatically
         # stores as float32 (C,H,W), gets skipped for policy inference.
@@ -63,8 +63,8 @@ class LiberoInputs(transforms.DataTransformFn):
         # and two wrist views (left and right). If your dataset does not have a particular type
         # of image, e.g. wrist images, you can comment it out here and replace it with zeros like we do for the
         # right wrist image below.
-        base_image = _parse_image(data["observation/image"])
-        wrist_image = _parse_image(data["observation/wrist_image"])
+        base_image = _parse_image(data["image"])
+        wrist_image = _parse_image(data["wrist_image"])
 
         # Create inputs dict. Do not change the keys in the dict below.
         inputs = {
@@ -101,7 +101,7 @@ class LiberoInputs(transforms.DataTransformFn):
 
 
 @dataclasses.dataclass(frozen=True)
-class LiberoOutputs(transforms.DataTransformFn):
+class ManiskillOutputs(transforms.DataTransformFn):
     """
     This class is used to convert outputs from the model back the the dataset specific format. It is
     used for inference only.
@@ -114,4 +114,4 @@ class LiberoOutputs(transforms.DataTransformFn):
         # dimension, we need to now parse out the correct number of actions in the return dict.
         # For Libero, we only return the first 7 actions (since the rest is padding).
         # For your own dataset, replace `7` with the action dimension of your dataset.
-        return {"actions": np.asarray(data["actions"][:, :7])}
+        return {"actions": np.asarray(data["actions"][:, :13])}

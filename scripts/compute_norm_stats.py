@@ -47,15 +47,15 @@ def main(config_name: str, max_frames: int | None = None):
     if max_frames is not None and max_frames < num_frames:
         num_frames = max_frames
         shuffle = True
-
+    print("max_frames:",max_frames, " num_frames: ",num_frames)
     data_loader = _data_loader.TorchDataLoader(
         dataset,
-        local_batch_size=1,
+        local_batch_size=2, # need to be multiply of gpu numbers
         num_workers=8,
         shuffle=shuffle,
         num_batches=num_frames,
     )
-
+    print("data_loader initialize finish")
     keys = ["state", "actions"]
     stats = {key: normalize.RunningStats() for key in keys}
 
