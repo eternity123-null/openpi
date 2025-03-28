@@ -7,7 +7,7 @@ import difflib
 import logging
 import pathlib
 from typing import Any, Protocol, TypeAlias
-
+import pdb
 import etils.epath as epath
 import flax.nnx as nnx
 from typing_extensions import override
@@ -20,6 +20,7 @@ import openpi.models.tokenizer as _tokenizer
 import openpi.policies.aloha_policy as aloha_policy
 import openpi.policies.droid_policy as droid_policy
 import openpi.policies.libero_policy as libero_policy
+import openpi.policies.fetch_policy as fetch_policy
 import openpi.shared.download as _download
 import openpi.shared.normalize as _normalize
 import openpi.training.optimizer as _optimizer
@@ -60,8 +61,8 @@ class AssetsConfig:
 
 @dataclasses.dataclass(frozen=True)
 class DataConfig:
-    # LeRobot repo id. If None, fake data will be created.
-    repo_id: str | None = None
+    # LeRobot repo id(s). If None, fake data will be created.
+    repo_ids: list[str] | None = None
     # Directory within the assets directory containing the data assets.
     asset_id: str | None = None
     # Contains precomputed normalization stats. If None, normalization will not be performed.
@@ -137,7 +138,7 @@ class ModelTransformFactory(GroupFactory):
 @dataclasses.dataclass(frozen=True)
 class DataConfigFactory(abc.ABC):
     # The LeRobot repo id.
-    repo_id: str = tyro.MISSING
+    repo_ids: list[str] = tyro.MISSING
     # Determines how the assets will be loaded.
     assets: AssetsConfig = dataclasses.field(default_factory=AssetsConfig)
     # Base config that will be updated by the factory.
@@ -148,11 +149,11 @@ class DataConfigFactory(abc.ABC):
         """Create a data config."""
 
     def create_base_config(self, assets_dirs: pathlib.Path) -> DataConfig:
-        repo_id = self.repo_id if self.repo_id is not tyro.MISSING else None
-        asset_id = self.assets.asset_id or repo_id
+        repo_ids = self.repo_ids if self.repo_ids is not tyro.MISSING else None
+        asset_id = self.assets.asset_id or "+".join(sorted(repo_ids)) if repo_ids else None
         return dataclasses.replace(
             self.base_config or DataConfig(),
-            repo_id=repo_id,
+            repo_ids=repo_ids,
             asset_id=asset_id,
             norm_stats=self._load_norm_stats(epath.Path(self.assets.assets_dir or assets_dirs), asset_id),
         )
@@ -161,22 +162,29 @@ class DataConfigFactory(abc.ABC):
         if asset_id is None:
             return None
         try:
-            data_assets_dir = str(assets_dir / asset_id)
-            norm_stats = _normalize.load(_download.maybe_download(data_assets_dir))
-            logging.info(f"Loaded norm stats from {data_assets_dir}")
+            combined_dir = str(assets_dir / asset_id)
+            norm_stats = _normalize.load(_download.maybe_download(combined_dir))
+            logging.info(f"Loaded norm stats from {combined_dir}")
             return norm_stats
         except FileNotFoundError:
-            logging.info(f"Norm stats not found in {data_assets_dir}, skipping.")
+            if self.repo_ids and len(self.repo_ids) > 0:
+                first_repo_dir = str(assets_dir / self.repo_ids[0])
+                try:
+                    norm_stats = _normalize.load(_download.maybe_download(first_repo_dir))
+                    logging.info(f"Loaded norm stats from {first_repo_dir}")
+                    return norm_stats
+                except FileNotFoundError:
+                    logging.info(f"Norm stats not found in {first_repo_dir}, skipping.")
         return None
 
 
 @dataclasses.dataclass(frozen=True)
 class FakeDataConfig(DataConfigFactory):
-    repo_id: str = "fake"
+    repo_ids: list[str] = dataclasses.field(default_factory=lambda: ["fake"])
 
     @override
     def create(self, assets_dirs: pathlib.Path, model_config: _model.BaseModelConfig) -> DataConfig:
-        return DataConfig(repo_id=self.repo_id)
+        return DataConfig(repo_ids=self.repo_ids)
 
 
 @dataclasses.dataclass(frozen=True)
@@ -324,6 +332,86 @@ class LeRobotLiberoDataConfig(DataConfigFactory):
 
 
 @dataclasses.dataclass(frozen=True)
+class LeRobotFetchDataConfig(DataConfigFactory):
+    """
+    This config is used to configure transforms that are applied at various parts of the data pipeline.
+    For your own dataset, you can copy this class and modify the transforms to match your dataset based on the
+    comments below.
+    """
+
+    use_delta_joint_actions: bool = True
+
+    @override
+    def create(self, assets_dirs: pathlib.Path, model_config: _model.BaseModelConfig) -> DataConfig:
+        # The repack transform is *only* applied to the data coming from the dataset,
+        # and *not* during inference. We can use it to make inputs from the dataset look
+        # as close as possible to those coming from the inference environment (e.g. match the keys).
+        # Below, we match the keys in the dataset (which we defined in the data conversion script) to
+        # the keys we use in our inference pipeline (defined in the inference script for libero).
+        # For your own dataset, first figure out what keys your environment passes to the policy server
+        # and then modify the mappings below so your dataset's keys get matched to those target keys.
+        # The repack transform simply remaps key names here.
+        print("-----------------")
+        print("Data is loading..")
+        print("-----------------")
+
+        repack_transform = _transforms.Group(
+            inputs=[
+                _transforms.RepackTransform(
+                    {
+                        "image": "image",
+                        "wrist_image": "wrist_image",
+                        "state": "state",
+                        "actions": "actions",
+                        "prompt": "prompt",
+                    }
+                )
+            ]
+        )
+        # The data transforms are applied to the data coming from the dataset *and* during inference.
+        # Below, we define the transforms for data going into the model (``inputs``) and the transforms
+        # for data coming out of the model (``outputs``) (the latter is only used during inference).
+        # We defined these transforms in `libero_policy.py`. You can check the detailed comments there for
+        # how to modify the transforms to match your dataset. Once you created your own transforms, you can
+        # replace the transforms below with your own.
+        data_transforms = _transforms.Group(
+            inputs=[fetch_policy.FetchInputs(action_dim=model_config.action_dim, model_type=model_config.model_type)],
+            outputs=[fetch_policy.FetchOutputs()],
+        )
+
+        # One additional data transform: pi0 models are trained on delta actions (relative to the first
+        # state in each action chunk). IF your data has ``absolute`` actions (e.g. target joint angles)
+        # you can uncomment the following line to convert the actions to delta actions. The only exception
+        # is for the gripper actions which are always absolute.
+        # In the example below, we would apply the delta conversion to the first 6 actions (joints) and
+        # leave the 7th action (gripper) unchanged, i.e. absolute.
+        # In Libero, the raw actions in the dataset are already delta actions, so we *do not* need to
+        # apply a separate delta conversion (that's why it's commented out). Choose whether to apply this
+        # transform based on whether your dataset uses ``absolute`` or ``delta`` actions out of the box.
+
+        # TODO(karl): comment this out once we have updated the Libero checkpoints to not use
+        # the delta action transform
+        if self.use_delta_joint_actions:
+            delta_action_mask = _transforms.make_bool_mask(13)
+            data_transforms = data_transforms.push(
+                inputs=[_transforms.DeltaActions(delta_action_mask)],
+                outputs=[_transforms.AbsoluteActions(delta_action_mask)],
+            )
+
+        # Model transforms include things like tokenizing the prompt and action targets
+        # You do not need to change anything here for your own dataset.
+        model_transforms = ModelTransformFactory()(model_config)
+
+        # We return all data transforms for training and inference. No need to change anything here.
+        return dataclasses.replace(
+            self.create_base_config(assets_dirs),
+            repack_transforms=repack_transform,
+            data_transforms=data_transforms,
+            model_transforms=model_transforms,
+        )
+
+
+@dataclasses.dataclass(frozen=True)
 class TrainConfig:
     # Name of the config. Must be unique. Will be used to reference this config.
     name: tyro.conf.Suppress[str]
@@ -366,7 +454,7 @@ class TrainConfig:
     num_train_steps: int = 30_000
 
     # How often (in steps) to log training metrics.
-    log_interval: int = 100
+    log_interval: int = 10
     # How often (in steps) to save checkpoints.
     save_interval: int = 1000
     # If set, any existing checkpoints matching step % keep_period == 0 will not be deleted.
@@ -413,6 +501,28 @@ class TrainConfig:
 
 # Use `get_config` if you need to get a config by name in your code.
 _CONFIGS = [
+    TrainConfig(
+        name="pi0_fetch_lora",
+        model=pi0.Pi0Config(paligemma_variant="gemma_2b_lora", action_expert_variant="gemma_300m_lora"),
+        data=LeRobotFetchDataConfig(
+            repo_ids=["place/place_bowl","place/place_cracker_box"],
+            base_config=DataConfig(
+                local_files_only=True,  # Set to True for local-only datasets.
+                prompt_from_task=True,
+            ),
+            assets=AssetsConfig(
+                assets_dir="/home/hairuo/VLA/assets/pi0_fetch_lora",
+                asset_id="place_bowl+place_cracker_box",
+            ),
+            use_delta_joint_actions=True
+        ),
+        weight_loader=weight_loaders.CheckpointWeightLoader("/data/model/openpi-assets/checkpoints/pi0_base/params"),
+        num_train_steps=35000,
+        freeze_filter=pi0.Pi0Config(
+            paligemma_variant="gemma_2b_lora", action_expert_variant="gemma_300m_lora"
+        ).get_freeze_filter(),
+        ema_decay=None,
+    ),
     #
     # Inference Aloha configs.
     #
@@ -478,154 +588,154 @@ _CONFIGS = [
     # are using, and other hyperparameters like how many training steps to run or what learning rate to use.
     # For your own dataset, you can copy this class and modify the dataset name, and data transforms based on
     # the comments below.
-    TrainConfig(
-        # Change the name to reflect your model and dataset.
-        name="pi0_libero",
-        # Here you define the model config -- In this example we use pi0 as the model
-        # architecture and perform *full* finetuning. in the examples below we show how to modify
-        # this to perform *low-memory* (LORA) finetuning and use pi0-FAST as an alternative architecture.
-        model=pi0.Pi0Config(),
-        # Here you define the dataset you are training on. In this example we use the Libero
-        # dataset. For your own dataset, you can change the repo_id to point to your dataset.
-        # Also modify the DataConfig to use the new config you made for your dataset above.
-        data=LeRobotLiberoDataConfig(
-            repo_id="physical-intelligence/libero",
-            base_config=DataConfig(
-                local_files_only=False,  # Set to True for local-only datasets.
-                # This flag determines whether we load the prompt (i.e. the task instruction) from the
-                # ``task`` field in the LeRobot dataset. If set to True, the prompt will show up in
-                # a field called ``prompt`` in the input dict. The recommended setting is True.
-                prompt_from_task=True,
-            ),
-        ),
-        # Here you define which pre-trained checkpoint you want to load to initialize the model.
-        # This should match the model config you chose above -- i.e. in this case we use the pi0 base model.
-        weight_loader=weight_loaders.CheckpointWeightLoader("s3://openpi-assets/checkpoints/pi0_base/params"),
-        # Below you can define other hyperparameters like the learning rate, number of training steps, etc.
-        # Check the base TrainConfig class for a full list of available hyperparameters.
-        num_train_steps=30_000,
-    ),
-    TrainConfig(
-        name="pi0_libero_low_mem_finetune",
-        # Here is an example of loading a pi0 model for LoRA fine-tuning.
-        model=pi0.Pi0Config(paligemma_variant="gemma_2b_lora", action_expert_variant="gemma_300m_lora"),
-        data=LeRobotLiberoDataConfig(
-            repo_id="physical-intelligence/libero",
-            base_config=DataConfig(
-                local_files_only=False,  # Set to True for local-only datasets.
-                prompt_from_task=True,
-            ),
-        ),
-        weight_loader=weight_loaders.CheckpointWeightLoader("s3://openpi-assets/checkpoints/pi0_base/params"),
-        num_train_steps=30_000,
-        # The freeze filter defines which parameters should be frozen during training.
-        # We have a convenience function in the model config that returns the default freeze filter
-        # for the given model config for LoRA finetuning. Just make sure it matches the model config
-        # you chose above.
-        freeze_filter=pi0.Pi0Config(
-            paligemma_variant="gemma_2b_lora", action_expert_variant="gemma_300m_lora"
-        ).get_freeze_filter(),
-        # Turn off EMA for LoRA finetuning.
-        ema_decay=None,
-    ),
-    TrainConfig(
-        name="pi0_fast_libero",
-        # Here is an example of loading a pi0-FAST model for full finetuning.
-        # Modify action_dim and action_horizon to match your dataset (action horizon is equal to
-        # the desired action chunk length).
-        # The max_token_len is the maximum number of (non-image) tokens the model can handle.
-        # This includes the tokenized prompt, proprioceptive state, and (FAST-tokenized) action tokens.
-        # Choosing this value too small may chop off tokens at the end of your sequence (the code will throw
-        # a warning), while choosing it too large will waste memory (since we pad each batch element to the
-        # max_token_len). A good rule of thumb is to use approx 180 for single-arm robots, and approx 250 for
-        # two-arm robots. Generally, err on the lower side here first, and potentially increase the value if
-        # you see many warnings being thrown during training.
-        model=pi0_fast.Pi0FASTConfig(action_dim=7, action_horizon=10, max_token_len=180),
-        data=LeRobotLiberoDataConfig(
-            repo_id="physical-intelligence/libero",
-            base_config=DataConfig(
-                local_files_only=False,  # Set to True for local-only datasets.
-                prompt_from_task=True,
-            ),
-        ),
-        # Note that we load the pi0-FAST base model checkpoint here.
-        weight_loader=weight_loaders.CheckpointWeightLoader("s3://openpi-assets/checkpoints/pi0_fast_base/params"),
-        num_train_steps=30_000,
-    ),
-    TrainConfig(
-        name="pi0_fast_libero_low_mem_finetune",
-        # Here is an example of loading a pi0-FAST model for LoRA finetuning.
-        # For setting action_dim, action_horizon, and max_token_len, see the comments above.
-        model=pi0_fast.Pi0FASTConfig(
-            action_dim=7, action_horizon=10, max_token_len=180, paligemma_variant="gemma_2b_lora"
-        ),
-        data=LeRobotLiberoDataConfig(
-            repo_id="physical-intelligence/libero",
-            base_config=DataConfig(
-                local_files_only=False,  # Set to True for local-only datasets.
-                prompt_from_task=True,
-            ),
-        ),
-        weight_loader=weight_loaders.CheckpointWeightLoader("s3://openpi-assets/checkpoints/pi0_fast_base/params"),
-        num_train_steps=30_000,
-        # Again, make sure to match the model config above when extracting the freeze filter
-        # that specifies which parameters should be frozen during LoRA finetuning.
-        freeze_filter=pi0_fast.Pi0FASTConfig(
-            action_dim=7, action_horizon=10, max_token_len=180, paligemma_variant="gemma_2b_lora"
-        ).get_freeze_filter(),
-        # Turn off EMA for LoRA finetuning.
-        ema_decay=None,
-    ),
+    # TrainConfig(
+    #     # Change the name to reflect your model and dataset.
+    #     name="pi0_libero",
+    #     # Here you define the model config -- In this example we use pi0 as the model
+    #     # architecture and perform *full* finetuning. in the examples below we show how to modify
+    #     # this to perform *low-memory* (LORA) finetuning and use pi0-FAST as an alternative architecture.
+    #     model=pi0.Pi0Config(),
+    #     # Here you define the dataset you are training on. In this example we use the Libero
+    #     # dataset. For your own dataset, you can change the repo_id to point to your dataset.
+    #     # Also modify the DataConfig to use the new config you made for your dataset above.
+    #     data=LeRobotLiberoDataConfig(
+    #         repo_id="physical-intelligence/libero",
+    #         base_config=DataConfig(
+    #             local_files_only=False,  # Set to True for local-only datasets.
+    #             # This flag determines whether we load the prompt (i.e. the task instruction) from the
+    #             # ``task`` field in the LeRobot dataset. If set to True, the prompt will show up in
+    #             # a field called ``prompt`` in the input dict. The recommended setting is True.
+    #             prompt_from_task=True,
+    #         ),
+    #     ),
+    #     # Here you define which pre-trained checkpoint you want to load to initialize the model.
+    #     # This should match the model config you chose above -- i.e. in this case we use the pi0 base model.
+    #     weight_loader=weight_loaders.CheckpointWeightLoader("s3://openpi-assets/checkpoints/pi0_base/params"),
+    #     # Below you can define other hyperparameters like the learning rate, number of training steps, etc.
+    #     # Check the base TrainConfig class for a full list of available hyperparameters.
+    #     num_train_steps=30_000,
+    # ),
+    # TrainConfig(
+    #     name="pi0_libero_low_mem_finetune",
+    #     # Here is an example of loading a pi0 model for LoRA fine-tuning.
+    #     model=pi0.Pi0Config(paligemma_variant="gemma_2b_lora", action_expert_variant="gemma_300m_lora"),
+    #     data=LeRobotLiberoDataConfig(
+    #         repo_id="physical-intelligence/libero",
+    #         base_config=DataConfig(
+    #             local_files_only=False,  # Set to True for local-only datasets.
+    #             prompt_from_task=True,
+    #         ),
+    #     ),
+    #     weight_loader=weight_loaders.CheckpointWeightLoader("s3://openpi-assets/checkpoints/pi0_base/params"),
+    #     num_train_steps=30_000,
+    #     # The freeze filter defines which parameters should be frozen during training.
+    #     # We have a convenience function in the model config that returns the default freeze filter
+    #     # for the given model config for LoRA finetuning. Just make sure it matches the model config
+    #     # you chose above.
+    #     freeze_filter=pi0.Pi0Config(
+    #         paligemma_variant="gemma_2b_lora", action_expert_variant="gemma_300m_lora"
+    #     ).get_freeze_filter(),
+    #     # Turn off EMA for LoRA finetuning.
+    #     ema_decay=None,
+    # ),
+    # TrainConfig(
+    #     name="pi0_fast_libero",
+    #     # Here is an example of loading a pi0-FAST model for full finetuning.
+    #     # Modify action_dim and action_horizon to match your dataset (action horizon is equal to
+    #     # the desired action chunk length).
+    #     # The max_token_len is the maximum number of (non-image) tokens the model can handle.
+    #     # This includes the tokenized prompt, proprioceptive state, and (FAST-tokenized) action tokens.
+    #     # Choosing this value too small may chop off tokens at the end of your sequence (the code will throw
+    #     # a warning), while choosing it too large will waste memory (since we pad each batch element to the
+    #     # max_token_len). A good rule of thumb is to use approx 180 for single-arm robots, and approx 250 for
+    #     # two-arm robots. Generally, err on the lower side here first, and potentially increase the value if
+    #     # you see many warnings being thrown during training.
+    #     model=pi0_fast.Pi0FASTConfig(action_dim=7, action_horizon=10, max_token_len=180),
+    #     data=LeRobotLiberoDataConfig(
+    #         repo_id="physical-intelligence/libero",
+    #         base_config=DataConfig(
+    #             local_files_only=False,  # Set to True for local-only datasets.
+    #             prompt_from_task=True,
+    #         ),
+    #     ),
+    #     # Note that we load the pi0-FAST base model checkpoint here.
+    #     weight_loader=weight_loaders.CheckpointWeightLoader("s3://openpi-assets/checkpoints/pi0_fast_base/params"),
+    #     num_train_steps=30_000,
+    # ),
+    # TrainConfig(
+    #     name="pi0_fast_libero_low_mem_finetune",
+    #     # Here is an example of loading a pi0-FAST model for LoRA finetuning.
+    #     # For setting action_dim, action_horizon, and max_token_len, see the comments above.
+    #     model=pi0_fast.Pi0FASTConfig(
+    #         action_dim=7, action_horizon=10, max_token_len=180, paligemma_variant="gemma_2b_lora"
+    #     ),
+    #     data=LeRobotLiberoDataConfig(
+    #         repo_id="physical-intelligence/libero",
+    #         base_config=DataConfig(
+    #             local_files_only=False,  # Set to True for local-only datasets.
+    #             prompt_from_task=True,
+    #         ),
+    #     ),
+    #     weight_loader=weight_loaders.CheckpointWeightLoader("s3://openpi-assets/checkpoints/pi0_fast_base/params"),
+    #     num_train_steps=30_000,
+    #     # Again, make sure to match the model config above when extracting the freeze filter
+    #     # that specifies which parameters should be frozen during LoRA finetuning.
+    #     freeze_filter=pi0_fast.Pi0FASTConfig(
+    #         action_dim=7, action_horizon=10, max_token_len=180, paligemma_variant="gemma_2b_lora"
+    #     ).get_freeze_filter(),
+    #     # Turn off EMA for LoRA finetuning.
+    #     ema_decay=None,
+    # ),
     #
     # Fine-tuning Aloha configs.
     #
     # This is a test config that is used to illustate how train on a custom LeRobot dataset.
     # For instuctions on how to convert and train on your own Aloha dataset see examples/aloha_real/README.md
-    TrainConfig(
-        name="pi0_aloha_pen_uncap",
-        model=pi0.Pi0Config(),
-        data=LeRobotAlohaDataConfig(
-            repo_id="physical-intelligence/aloha_pen_uncap_diverse",
-            assets=AssetsConfig(
-                assets_dir="s3://openpi-assets/checkpoints/pi0_base/assets",
-                asset_id="trossen",
-            ),
-            default_prompt="uncap the pen",
-            repack_transforms=_transforms.Group(
-                inputs=[
-                    _transforms.RepackTransform(
-                        {
-                            "images": {
-                                "cam_high": "observation.images.cam_high",
-                                "cam_left_wrist": "observation.images.cam_left_wrist",
-                                "cam_right_wrist": "observation.images.cam_right_wrist",
-                            },
-                            "state": "observation.state",
-                            "actions": "action",
-                        }
-                    )
-                ]
-            ),
-            base_config=DataConfig(
-                local_files_only=False,  # Set to True for local-only datasets.
-            ),
-        ),
-        weight_loader=weight_loaders.CheckpointWeightLoader("s3://openpi-assets/checkpoints/pi0_base/params"),
-        num_train_steps=20_000,
-    ),
+    # TrainConfig(
+    #     name="pi0_aloha_pen_uncap",
+    #     model=pi0.Pi0Config(),
+    #     data=LeRobotAlohaDataConfig(
+    #         repo_id="physical-intelligence/aloha_pen_uncap_diverse",
+    #         assets=AssetsConfig(
+    #             assets_dir="s3://openpi-assets/checkpoints/pi0_base/assets",
+    #             asset_id="trossen",
+    #         ),
+    #         default_prompt="uncap the pen",
+    #         repack_transforms=_transforms.Group(
+    #             inputs=[
+    #                 _transforms.RepackTransform(
+    #                     {
+    #                         "images": {
+    #                             "cam_high": "observation.images.cam_high",
+    #                             "cam_left_wrist": "observation.images.cam_left_wrist",
+    #                             "cam_right_wrist": "observation.images.cam_right_wrist",
+    #                         },
+    #                         "state": "observation.state",
+    #                         "actions": "action",
+    #                     }
+    #                 )
+    #             ]
+    #         ),
+    #         base_config=DataConfig(
+    #             local_files_only=False,  # Set to True for local-only datasets.
+    #         ),
+    #     ),
+    #     weight_loader=weight_loaders.CheckpointWeightLoader("s3://openpi-assets/checkpoints/pi0_base/params"),
+    #     num_train_steps=20_000,
+    # ),
     # This config is used to demonstrate how to train on a simple simulated environment.
-    TrainConfig(
-        name="pi0_aloha_sim",
-        model=pi0.Pi0Config(),
-        data=LeRobotAlohaDataConfig(
-            repo_id="lerobot/aloha_sim_transfer_cube_human",
-            default_prompt="Transfer cube",
-            use_delta_joint_actions=False,
-        ),
-        weight_loader=weight_loaders.CheckpointWeightLoader("s3://openpi-assets/checkpoints/pi0_base/params"),
-        num_train_steps=20_000,
-    ),
-    #
+    # TrainConfig(
+    #     name="pi0_aloha_sim",
+    #     model=pi0.Pi0Config(),
+    #     data=LeRobotAlohaDataConfig(
+    #         repo_id="lerobot/aloha_sim_transfer_cube_human",
+    #         default_prompt="Transfer cube",
+    #         use_delta_joint_actions=False,
+    #     ),
+    #     weight_loader=weight_loaders.CheckpointWeightLoader("s3://openpi-assets/checkpoints/pi0_base/params"),
+    #     num_train_steps=20_000,
+    # ),
+    
     # Debugging configs.
     #
     TrainConfig(

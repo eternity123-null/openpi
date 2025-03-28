@@ -1,8 +1,9 @@
+import bisect
 from collections.abc import Iterator, Sequence
 import multiprocessing
 import os
 import typing
-from typing import Protocol, SupportsIndex, TypeVar
+from typing import Protocol, SupportsIndex, TypeVar, Union, List
 
 import jax
 import jax.numpy as jnp
@@ -81,34 +82,73 @@ class FakeDataset(Dataset):
         return self._num_samples
 
 
+class MultiDataset(Dataset):
+    """Dataset that combines multiple datasets."""
+    
+    def __init__(self, datasets: List[Dataset]):
+        self._datasets = datasets
+        self._cumulative_sizes = self._calculate_cumulative_sizes()
+        
+    def _calculate_cumulative_sizes(self):
+        cumulative_sizes = []
+        running_sum = 0
+        for dataset in self._datasets:
+            running_sum += len(dataset)
+            cumulative_sizes.append(running_sum)
+        return cumulative_sizes
+        
+    def __len__(self):
+        return self._cumulative_sizes[-1] if self._cumulative_sizes else 0
+        
+    def __getitem__(self, idx):
+        if idx < 0:
+            if -idx > len(self):
+                raise ValueError("absolute value of index should not exceed dataset length")
+            idx = len(self) + idx
+            
+        dataset_idx = bisect.bisect_right(self._cumulative_sizes, idx)
+        if dataset_idx == 0:
+            sample_idx = idx
+        else:
+            sample_idx = idx - self._cumulative_sizes[dataset_idx - 1]
+            
+        return self._datasets[dataset_idx][sample_idx]
+
+
 def create_dataset(data_config: _config.DataConfig, model_config: _model.BaseModelConfig) -> Dataset:
     """Create a dataset for training."""
-    repo_id = data_config.repo_id
-    if repo_id is None:
-        raise ValueError("Repo ID is not set. Cannot create dataset.")
-    if repo_id == "fake":
+    repo_ids = data_config.repo_ids
+    if repo_ids is None:
+        raise ValueError("Repo IDs are not set. Cannot create dataset.")
+    if "fake" in repo_ids:
         return FakeDataset(model_config, num_samples=1024)
 
-    dataset_meta = lerobot_dataset.LeRobotDatasetMetadata(repo_id, local_files_only=data_config.local_files_only)
-    dataset = lerobot_dataset.LeRobotDataset(
-        data_config.repo_id,
-        delta_timestamps={
-            key: [t / dataset_meta.fps for t in range(model_config.action_horizon)]
-            for key in data_config.action_sequence_keys
-        },
-        local_files_only=data_config.local_files_only,
-    )
+    datasets = []
+    for repo_id in repo_ids:
+        dataset_meta = lerobot_dataset.LeRobotDatasetMetadata(repo_id, local_files_only=data_config.local_files_only)
+        dataset = lerobot_dataset.LeRobotDataset(
+            repo_id,
+            delta_timestamps={
+                key: [t / dataset_meta.fps for t in range(model_config.action_horizon)]
+                for key in data_config.action_sequence_keys
+            },
+            local_files_only=data_config.local_files_only,
+        )
 
-    if data_config.prompt_from_task:
-        dataset = TransformedDataset(dataset, [_transforms.PromptFromLeRobotTask(dataset_meta.tasks)])
-
-    return dataset
+        if data_config.prompt_from_task:
+            dataset = TransformedDataset(dataset, [_transforms.PromptFromLeRobotTask(dataset_meta.tasks)])
+        
+        datasets.append(dataset)
+    
+    if len(datasets) == 1:
+        return datasets[0]
+    return MultiDataset(datasets)
 
 
 def transform_dataset(dataset: Dataset, data_config: _config.DataConfig, *, skip_norm_stats: bool = False) -> Dataset:
     """Transform the dataset by applying the data transforms."""
     norm_stats = {}
-    if data_config.repo_id != "fake" and not skip_norm_stats:
+    if not any(repo_id == "fake" for repo_id in data_config.repo_ids) and not skip_norm_stats:
         if data_config.norm_stats is None:
             raise ValueError(
                 "Normalization stats not found. "

@@ -8,12 +8,12 @@ to the config assets directory.
 import numpy as np
 import tqdm
 import tyro
+from pathlib import Path
 
 import openpi.shared.normalize as normalize
 import openpi.training.config as _config
 import openpi.training.data_loader as _data_loader
 import openpi.transforms as transforms
-
 
 class RemoveStrings(transforms.DataTransformFn):
     def __call__(self, x: dict) -> dict:
@@ -22,8 +22,10 @@ class RemoveStrings(transforms.DataTransformFn):
 
 def create_dataset(config: _config.TrainConfig) -> tuple[_config.DataConfig, _data_loader.Dataset]:
     data_config = config.data.create(config.assets_dirs, config.model)
-    if data_config.repo_id is None:
-        raise ValueError("Data config must have a repo_id")
+    if data_config.repo_ids is None or len(data_config.repo_ids) == 0:
+        raise ValueError("Data config must have at least one repo_id")
+    
+    # Create a combined dataset from all repo_ids
     dataset = _data_loader.create_dataset(data_config, config.model)
     dataset = _data_loader.TransformedDataset(
         dataset,
@@ -40,7 +42,7 @@ def create_dataset(config: _config.TrainConfig) -> tuple[_config.DataConfig, _da
 def main(config_name: str, max_frames: int | None = None):
     config = _config.get_config(config_name)
     data_config, dataset = create_dataset(config)
-
+    
     num_frames = len(dataset)
     shuffle = False
 
@@ -59,16 +61,24 @@ def main(config_name: str, max_frames: int | None = None):
     keys = ["state", "actions"]
     stats = {key: normalize.RunningStats() for key in keys}
 
-    for batch in tqdm.tqdm(data_loader, total=num_frames, desc="Computing stats"):
+    for batch in tqdm.tqdm(data_loader, total=num_frames, desc="Computing combined stats"):
         for key in keys:
             values = np.asarray(batch[key][0])
             stats[key].update(values.reshape(-1, values.shape[-1]))
 
     norm_stats = {key: stats.get_statistics() for key, stats in stats.items()}
 
-    output_path = config.assets_dirs / data_config.repo_id
-    print(f"Writing stats to: {output_path}")
-    normalize.save(output_path, norm_stats)
+    # Save combined stats to a single file (use the first repo_id or a combined name)
+    if len(data_config.repo_ids) == 1:
+        output_dir = config.assets_dirs / data_config.repo_ids[0]
+    else:
+        # 生成合并目录名，例如: repo1+repo2+repo3
+        merged_name = "+".join(sorted(repo_id.split("/")[-1] for repo_id in data_config.repo_ids))
+        output_dir = config.assets_dirs / merged_name
+    
+    output_dir.mkdir(parents=True, exist_ok=True)
+    print(f"Writing combined stats to: {output_dir}")
+    normalize.save(output_dir, norm_stats)
 
 
 if __name__ == "__main__":
