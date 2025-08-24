@@ -6,7 +6,7 @@ import dataclasses
 import difflib
 import logging
 import pathlib
-from typing import Any, Protocol, TypeAlias
+from typing import Any, Protocol, TypeAlias, List
 
 import etils.epath as epath
 import flax.nnx as nnx
@@ -87,12 +87,15 @@ class DataConfig:
     action_sequence_keys: Sequence[str] = ("actions",)
 
     # If true, will use the LeRobot dataset task to define the prompt.
-    prompt_from_task: bool = False
+    prompt_from_task: bool = True
 
     # Only used for RLDS data loader (ie currently only used for DROID).
     rlds_data_dir: str | None = None
     # Action space for DROID dataset.
     action_space: droid_rlds_dataset.DroidActionSpace | None = None
+    
+    use_multi_dataset: bool = False
+    repo_ids: List[str] = []
 
 
 class GroupFactory(Protocol):
