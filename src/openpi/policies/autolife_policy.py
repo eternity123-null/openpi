@@ -108,7 +108,7 @@ class AutolifeInputs(transforms.DataTransformFn):
         # Pass the prompt (aka language instruction) to the model.
         # Keep this for your own dataset (but modify the key if the instruction is not
         # stored in "prompt"; the output dict always needs to have the key "prompt").
-        if "prompt" in data:
+        if "task" in data:
             inputs["prompt"] = data["task"]
 
         return inputs

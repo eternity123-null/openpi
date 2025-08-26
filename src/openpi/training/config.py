@@ -96,7 +96,7 @@ class DataConfig:
     action_space: droid_rlds_dataset.DroidActionSpace | None = None
     
     use_multi_dataset: bool = False
-    repo_ids: List[str] = []
+    repo_ids: List[str] = dataclasses.field(default_factory=list)
 
 
 class GroupFactory(Protocol):
@@ -660,6 +660,8 @@ _CONFIGS = [
         num_train_steps=30_000,
     ),
     
+    
+    
     TrainConfig(
         # Change the name to reflect your model and dataset.
         name="pi0_autolife",
@@ -671,7 +673,7 @@ _CONFIGS = [
         # dataset. For your own dataset, you can change the repo_id to point to your dataset.
         # Also modify the DataConfig to use the new config you made for your dataset above.
         data=LeRobotAutolifeDataConfig(
-            repo_id="scoop0824",
+            repo_id="scoop0825",
             base_config=DataConfig(
                 # This flag determines whether we load the prompt (i.e. the task instruction) from the
                 # ``task`` field in the LeRobot dataset. If set to True, the prompt will show up in
@@ -685,7 +687,46 @@ _CONFIGS = [
         # Below you can define other hyperparameters like the learning rate, number of training steps, etc.
         # Check the base TrainConfig class for a full list of available hyperparameters.
         num_train_steps=30_000,
+        batch_size = 32,
+        # Number of workers to use for the data loader. Increasing this number will speed up data loading but
+        # will increase memory and CPU usage.
+        num_workers = 36,
     ),
+    
+    TrainConfig(
+        # Change the name to reflect your model and dataset.
+        name="pi0_autolife_fast",
+        # Here you define the model config -- In this example we use pi0 as the model
+        # architecture and perform *full* finetuning. in the examples below we show how to modify
+        # this to perform *low-memory* (LORA) finetuning and use pi0-FAST as an alternative architecture.
+        model=pi0.Pi0Config(),
+        # Here you define the dataset you are training on. In this example we use the Libero
+        # dataset. For your own dataset, you can change the repo_id to point to your dataset.
+        # Also modify the DataConfig to use the new config you made for your dataset above.
+        data=LeRobotAutolifeDataConfig(
+            repo_id="scoop0825",
+            base_config=DataConfig(
+                # This flag determines whether we load the prompt (i.e. the task instruction) from the
+                # ``task`` field in the LeRobot dataset. If set to True, the prompt will show up in
+                # a field called ``prompt`` in the input dict. The recommended setting is True.
+                prompt_from_task=True,
+            ),
+        ),
+        # Here you define which pre-trained checkpoint you want to load to initialize the model.
+        # This should match the model config you chose above -- i.e. in this case we use the pi0 base model.
+        weight_loader=weight_loaders.CheckpointWeightLoader("/inspire/hdd/project/robot-decision/public/models/pi/pi0_base/params"),
+        # Below you can define other hyperparameters like the learning rate, number of training steps, etc.
+        # Check the base TrainConfig class for a full list of available hyperparameters.
+        num_train_steps=30_000,
+        batch_size = 32,
+        # Number of workers to use for the data loader. Increasing this number will speed up data loading but
+        # will increase memory and CPU usage.
+        num_workers = 36,
+    ),
+    
+    
+    
+    
     
     TrainConfig(
         name="pi0_libero_low_mem_finetune",
